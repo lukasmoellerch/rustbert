@@ -17,7 +17,7 @@ with open("tinybert.bin", "wb") as f:
 
     buf = io.BytesIO()
 
-    config_bytes = json.dumps(model.config.to_dict()).encode("utf-8") # type: ignore
+    config_bytes = json.dumps(model.config.to_dict()).encode("utf-8")  # type: ignore
     buf.write(len(config_bytes).to_bytes(8, byteorder="little"))
     buf.write(config_bytes)
 

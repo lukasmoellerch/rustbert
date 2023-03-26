@@ -1,9 +1,12 @@
+#![feature(target_feature_11)]
 use std::arch::aarch64::{vaddq_f32, vdupq_n_f32, vfmaq_f32, vgetq_lane_f32, vld1q_f32};
+use std::arch::is_aarch64_feature_detected;
 use std::{collections::HashMap, fs, io::Read, os::unix::prelude::FileExt, time::Instant};
 
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-static mut depth: usize = 0;
+static mut DEPTH: usize = 0;
 
 struct Timer {
     start: Instant,
@@ -12,8 +15,8 @@ struct Timer {
 impl Timer {
     fn new(message: &'static str) -> Self {
         unsafe {
-            println!("{}+ {}", " ".repeat(depth), message);
-            depth += 1;
+            println!("{}+ {}", " ".repeat(DEPTH), message);
+            DEPTH += 1;
         }
 
         Self {
@@ -28,10 +31,10 @@ impl Drop for Timer {
         let now = Instant::now();
         let elapsed = now - self.start;
         unsafe {
-            depth -= 1;
+            DEPTH -= 1;
             println!(
                 "{}- {} ({:03}ms)",
-                " ".repeat(depth),
+                " ".repeat(DEPTH),
                 self.message,
                 elapsed.as_micros() as f32 / 1000.0
             );
@@ -251,6 +254,7 @@ impl<T> DenseTensor<1, T> {
     fn get(&self, i: usize) -> &T {
         &self.data[i]
     }
+    #[allow(dead_code)]
     fn get_mut(&mut self, i: usize) -> &mut T {
         &mut self.data[i]
     }
@@ -274,12 +278,8 @@ impl<T> DenseTensor<3, T> {
     }
 }
 
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
-#[inline(always)]
-fn dot_f32_fast(va: &[f32], vb: &[f32]) -> f32 {
+#[target_feature(enable = "neon")]
+fn dot_f32_neon(va: &[f32], vb: &[f32]) -> f32 {
     unsafe {
         let mut accs = [vdupq_n_f32(0.0); 16];
 
@@ -327,7 +327,18 @@ fn dot_f32_fast(va: &[f32], vb: &[f32]) -> f32 {
 
         dot
     }
-} // end of eval
+}
+
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if is_aarch64_feature_detected!("neon") {
+            return unsafe { dot_f32_neon(a, b) };
+        }
+    }
+
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
 
 fn softmax_f32(a: &[f32]) -> Vec<f32> {
     let max = a.iter().fold(f32::NEG_INFINITY, |acc, x| acc.max(*x));
@@ -350,12 +361,18 @@ macro_rules! prefix {
     };
 }
 
+#[allow(dead_code)]
 type DenseTensor1F = DenseTensor<1, f32>;
+#[allow(dead_code)]
 type DenseTensor2F = DenseTensor<2, f32>;
+#[allow(dead_code)]
 type DenseTensor3F = DenseTensor<3, f32>;
 
+#[allow(dead_code)]
 type DenseTensor1U64 = DenseTensor<1, u64>;
+#[allow(dead_code)]
 type DenseTensor2U64 = DenseTensor<2, u64>;
+#[allow(dead_code)]
 type DenseTensor3U64 = DenseTensor<3, u64>;
 
 struct LayerNorm {
@@ -422,20 +439,28 @@ impl LinearLayer {
     #[inline(always)]
     fn forward(&self, input: &DenseTensor3F) -> DenseTensor3F {
         let _timer = Timer::new("LinearLayer::forward");
-
         let mut output = DenseTensor3F::zeros([input.shape[0], input.shape[1], self.bias.shape[0]]);
         let [batch_size, seq_len, _in_size] = input.shape;
         let out_size = self.bias.shape[0];
 
+        let k_block_size = 4;
+        let j_block_size = 4;
+
         for i in 0..batch_size {
-            for k in 0..out_size {
-                let weight_slice = self.weight.slice_x(k);
+            for k_block_start in (0..out_size).step_by(k_block_size) {
+                for j_block_start in (0..seq_len).step_by(j_block_size) {
+                    let k_block_end = (k_block_start + k_block_size).min(out_size);
+                    let j_block_end = (j_block_start + j_block_size).min(seq_len);
 
-                for j in 0..seq_len {
-                    let in_slice = input.slice_xy(i, j);
+                    for k in k_block_start..k_block_end {
+                        for j in j_block_start..j_block_end {
+                            let weight_slice = self.weight.slice_x(k);
+                            let in_slice = input.slice_xy(i, j);
 
-                    let sum = dot_f32_fast(&in_slice, &weight_slice);
-                    *output.get_mut(i, j, k) = sum + self.bias.get(k);
+                            let sum = dot_f32(&in_slice, &weight_slice);
+                            *output.get_mut(i, j, k) = sum + self.bias.get(k);
+                        }
+                    }
                 }
             }
         }
@@ -445,24 +470,24 @@ impl LinearLayer {
 
 #[derive(Deserialize)]
 struct BertConfig {
-    attention_probs_dropout_prob: f32,
-    gradient_checkpointing: bool,
-    hidden_act: String,
-    hidden_dropout_prob: f32,
+    // attention_probs_dropout_prob: f32,
+    // gradient_checkpointing: bool,
+    // hidden_act: String,
+    // hidden_dropout_prob: f32,
     hidden_size: usize,
-    initializer_range: f32,
-    intermediate_size: usize,
-    layer_norm_eps: f32,
-    max_position_embeddings: usize,
-    model_type: String,
+    // initializer_range: f32,
+    // intermediate_size: usize,
+    // layer_norm_eps: f32,
+    // max_position_embeddings: usize,
+    // model_type: String,
     num_attention_heads: usize,
     num_hidden_layers: usize,
-    pad_token_id: usize,
-    position_embedding_type: String,
-    transformers_version: String,
-    type_vocab_size: usize,
-    use_cache: bool,
-    vocab_size: usize,
+    // pad_token_id: usize,
+    // position_embedding_type: String,
+    // transformers_version: String,
+    // type_vocab_size: usize,
+    // use_cache: bool,
+    // vocab_size: usize,
 }
 
 struct BertEmbeddings {
@@ -554,7 +579,7 @@ impl BertSelfAttention {
     fn forward_batch(
         &self,
         hidden_states: &DenseTensor3F,
-        attention_mask: &DenseTensor2U64,
+        _attention_mask: &DenseTensor2U64,
     ) -> DenseTensor3F {
         let _timer = Timer::new("BertSelfAttention::forward_batch");
 
@@ -788,10 +813,14 @@ impl BertModel {
     }
 }
 
-fn main() -> Result<(), std::io::Error> {
-    // Open tinybert.bin
-    let file = std::fs::File::open("tinybert.bin").unwrap();
-    let mut reader = std::io::BufReader::new(file);
+fn read_parameter_metadata<R, C>(
+    reader: &mut R,
+) -> Result<(ParameterDescriptorMap, C), std::io::Error>
+where
+    R: Read,
+    C: DeserializeOwned,
+{
+    let mut reader = std::io::BufReader::new(reader);
 
     // parameter count (u64)
     let param_count = read_u64(&mut reader);
@@ -805,7 +834,7 @@ fn main() -> Result<(), std::io::Error> {
     let config_len = read_u64(&mut reader);
     let mut config_buf = vec![0u8; config_len as usize];
     reader.read_exact(&mut config_buf).unwrap();
-    let bert_config: BertConfig = serde_json::from_str(&String::from_utf8(config_buf).unwrap())?;
+    let config: C = serde_json::from_str(&String::from_utf8(config_buf).unwrap())?;
 
     for _ in 0..param_count {
         let name_len = read_u64(&mut reader);
@@ -831,22 +860,28 @@ fn main() -> Result<(), std::io::Error> {
     }
 
     // do pread() to read the data
-    let mut file = reader.into_inner();
-    let model = BertModel::from_file(bert_config, &mut file, &parameter_metadata, "");
+    Ok((parameter_metadata, config))
+}
 
-    let mut input_ids = DenseTensor2U64::zeros([1, 9]);
+fn main() -> Result<(), std::io::Error> {
+    // Open tinybert.bin
+    let mut file = std::fs::File::open("tinybert.bin").unwrap();
+
+    let (map, config) = read_parameter_metadata::<_, BertConfig>(&mut file).unwrap();
+    let model = BertModel::from_file(config, &mut file, &map, "");
+
+    let sequence_length = 9;
+    let mut input_ids = DenseTensor2U64::zeros([1, sequence_length]);
     input_ids
         .slice_x_mut(0)
         .copy_from_slice(&[101, 2129, 2116, 2111, 2444, 1999, 2414, 1029, 102]);
 
-    let token_type_ids = DenseTensor2U64::zeros([1, 9]);
-    let attention_mask = DenseTensor2U64::uniform([1, 9], 1);
+    let token_type_ids = DenseTensor2U64::zeros([1, sequence_length]);
+    let attention_mask = DenseTensor2U64::uniform([1, sequence_length], 1);
 
-    let start = std::time::Instant::now();
     let output = model.forward_batch(&input_ids, &token_type_ids, &attention_mask);
 
-    println!("{:?}", output);
-    println!("Took {} ms", start.elapsed().as_millis());
+    println!("{:?}", output.shape);
 
     Ok(())
 }
